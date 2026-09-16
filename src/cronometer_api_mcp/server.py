@@ -6,6 +6,7 @@ import os
 from datetime import date, timedelta
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .client import CronometerClient
 
@@ -14,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "cronometer",
+    # This server is always reached through a reverse proxy, which rewrites Host
+    # to its own name -- so FastMCP's Host/Origin check rejects every request
+    # unless it is turned off. FastMCP enables it by default only when bound to
+    # a loopback host, which is exactly the deployment this is not.
+    #
+    # What it protects against is a browser on the operator's own network being
+    # tricked into calling a locally-bound MCP server via DNS rebinding. That
+    # attack needs an unauthenticated endpoint; every request here carries a
+    # bearer token, which is the control actually doing the work.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "Cronometer MCP server for nutrition tracking via the mobile REST API. "
         "Provides access to food search, diary management, daily nutrition data, "
