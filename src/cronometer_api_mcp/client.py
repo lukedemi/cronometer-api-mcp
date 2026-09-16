@@ -627,51 +627,23 @@ class CronometerClient:
     #     recompute the row from its own MET tables and the entry's minutes,
     #     which would silently discard a figure measured elsewhere.
 
-    def _write_diary_entries(self, method: str, entries: list[dict]) -> list[dict]:
-        """Create or replace diary entries through the v3 collection.
+    # The write path is v2, and that is measured, not assumed. Probed against
+    # a live account on 2026-09-16, every v3 shape refused:
+    #
+    #   POST /api/v3/user/{id}/diary-entries   400 "Not able to deserialize
+    #       data provided." for ALL of {diaryEntries:[...]}, a bare array, a
+    #       bare object, and a faithful clone of a row Cronometer wrote itself
+    #   PUT  /api/v3/user/{id}/diary-entries   405
+    #   DELETE ditto, with an exercise entry   400, though the same call with
+    #       *serving* entries is what delete_entries has always used
+    #
+    # So the v3 diary-entries collection handles servings and does not know
+    # about exercise. Both verbs below answered 200 first time.
 
-        DELETE /api/v3/user/{id}/diary-entries is proven (delete_entries uses
-        it and Cronometer answers 204). POST and PUT on the same collection
-        are inferred from it rather than observed, so a 404 or 405 -- and only
-        those two, which are the codes that mean "no such endpoint" -- falls
-        back to the older v2 verb-per-action style. Whichever path answers is
-        logged, because the next person to read this should not have to guess
-        again.
-        """
-        resp = self._request_v3(
-            method, "/diary-entries", json_body={"diaryEntries": entries}
+    def _exercise_request(self, endpoint: str, entry: dict) -> dict:
+        return self._request(
+            endpoint, {"exercise": entry, "config": {"call_version": 2}}
         )
-        if resp.status_code in (404, 405):
-            v2 = "/api/v2/add_exercise" if method == "POST" else "/api/v2/edit_exercise"
-            logger.warning(
-                "v3 %s /diary-entries not available (%d); falling back to %s",
-                method,
-                resp.status_code,
-                v2,
-            )
-            out = []
-            for entry in entries:
-                data = self._request(
-                    v2, {"exercise": entry, "config": {"call_version": 2}}
-                )
-                out.append(data)
-            return out
-
-        if resp.status_code not in (200, 201, 204):
-            raise CronometerError(
-                f"{method} /diary-entries failed with status "
-                f"{resp.status_code}: {resp.text[:300]}"
-            )
-        logger.info(
-            "v3 %s /diary-entries: %d entry/entries, HTTP %d",
-            method,
-            len(entries),
-            resp.status_code,
-        )
-        if resp.status_code == 204 or not resp.text.strip():
-            return entries
-        body = resp.json()
-        return body if isinstance(body, list) else [body]
 
     def get_exercises(self, day: date | None = None) -> list[dict]:
         """Every exercise row in the diary for a day, wearable rows included.
@@ -707,8 +679,16 @@ class CronometerClient:
         entry = {
             "type": "Exercise",
             "userId": self._user_id,
-            "day": self._format_day(day),
+            # Zero-padded ISO here, NOT _format_day's non-padded "2026-9-16".
+            # The padded form is what the probed-and-accepted body carried and
+            # what Cronometer returns on read; add_serving's non-padded form is
+            # proven for servings and untested for exercise, so this does not
+            # borrow it.
+            "day": (day or date.today()).isoformat(),
             "name": name,
+            # Explicitly null rather than absent: the accepted body carried the
+            # key, and the server assigns the real id and returns it as `id`.
+            "exerciseId": None,
             "activityId": activity_id,
             "activitySpecId": 0,
             "minutes": int(minutes),
@@ -718,15 +698,17 @@ class CronometerClient:
             "order": 0,
             "meta": {},
         }
-        created = self._write_diary_entries("POST", [entry])
+        data = self._exercise_request("/api/v2/add_exercise", entry)
+        entry["exerciseId"] = data.get("id")
         logger.info(
-            "Logged exercise: %s, %.0f kcal, %d min, day=%s",
+            "Logged exercise: %s, %.0f kcal, %d min, day=%s (exercise_id=%s)",
             name,
             abs(calories),
             minutes,
             self._format_day(day),
+            entry["exerciseId"],
         )
-        return created[0] if created else entry
+        return entry
 
     def update_exercise(
         self,
@@ -769,9 +751,9 @@ class CronometerClient:
         if name is not None:
             entry["name"] = name
 
-        updated = self._write_diary_entries("PUT", [entry])
+        self._exercise_request("/api/v2/edit_exercise", entry)
         logger.info("Updated exercise %s on %s", exercise_id, self._format_day(day))
-        return updated[0] if updated else entry
+        return entry
 
     def delete_exercises(
         self, exercise_ids: list[str], day: date | None = None
