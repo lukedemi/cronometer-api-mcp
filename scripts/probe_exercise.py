@@ -1,50 +1,36 @@
 #!/usr/bin/env python3
-"""Find how Cronometer deletes an exercise entry. Add and edit are settled.
+"""Pin down `del_exercise`, the last unknown in the exercise write path.
 
-Probed against a live account, 2026-09-16:
+Probed against a live account, 2026-09-16. Settled:
 
-    POST   /api/v2/add_exercise             ✓ 200, returns {"id": <exerciseId>}
-    POST   /api/v2/edit_exercise            ✓ 200, calories stay pinned
-    POST   /api/v3/…/diary-entries          400 for every shape, incl. a clone
-                                               of a row Cronometer itself wrote
-    PUT    /api/v3/…/diary-entries          405
-    DELETE /api/v3/…/diary-entries          400 with an exercise entry, though
-                                               the same call with *servings* is
-                                               what delete_entries uses, and 204s
-    DELETE /api/v3/…/diary-entries/{id}     404
-    v2 delete_exercise / remove_exercise /
-       delete_exercises                     200 {"result":"FAIL",
-                                                 "error":"Invalid Command"}
-    v2 edit_exercise {deleted: true}        200, and the row stayed put
+    POST /api/v2/add_exercise    ✓ 200, returns {"id": <exerciseId>}
+    POST /api/v2/edit_exercise   ✓ 200, calories stay pinned
+    POST /api/v2/del_exercise    EXISTS — it answered
+        {"result":"FAIL","error":"JSONObject[\\"exerciseId\\"] not found."}
 
-**"Invalid Command" is the useful part.** The v2 API is a command dispatcher,
-so a name it does not know answers that — which makes an unknown endpoint
-distinguishable from a real one that merely disliked the body, and makes
-guessing *names* nearly free. One request per candidate, and the answer is
-unambiguous. That is most of what this script now does.
+Everything v3 is a dead end for exercise: POST 400 for every shape including a
+clone of a row Cronometer wrote itself, PUT 405, DELETE 400, and /exercises,
+/exercise-entries and /diary-entries/{id} all 404. That collection handles
+servings and does not know about exercise.
 
-`get_diary` is included as a positive control: if it also came back "Invalid
-Command", the oracle would be measuring something else and every ✗ below would
-be meaningless.
-
-The v3 attempts left are about the schema rather than the path. DELETE there
-demonstrably accepts *serving* objects fetched from the v2 diary, so v2 objects
-are v3-compatible in general — which makes it worth asking whether it rejects
-an exercise because of its `type` value or a field name, rather than because it
-cannot take one at all.
+**The v2 dispatcher answers two distinguishable ways, and both are useful.**
+An unknown command says `Invalid Command`; a real one with a bad body names
+the field it wanted, as `JSONObject["x"] not found.` The first found
+`del_exercise` where `delete_exercise`, `remove_exercise` and six other
+guesses were all wrong. The second means the required body does not have to be
+guessed at all: send the minimum, read which key it asks for, add that key,
+send again. This script does exactly that loop and prints the body it
+converged on.
 
     uv run python scripts/probe_exercise.py [YYYY-MM-DD]
 
-**This run creates no new rows if any are already there.** Earlier runs left
-two, and a probe that adds one every time it fails to find a delete is a probe
-that litters. It targets what exists, and only creates a row if the diary has
-none to work with.
-
-Credentials come from `.env` in the repo root (gitignored) — see the README.
+It then uses the discovered shape to remove every probe row earlier runs left
+behind. Credentials come from `.env` in the repo root — see the README.
 """
 
 import json
 import logging
+import re
 import sys
 from datetime import date, timedelta
 
@@ -61,32 +47,14 @@ if _dotenv:
 PROBE_NAME = "zz probe delete me"
 SWEEP_DAYS = 7
 
-# Every v2 name worth asking about. Cheap: one request each, and the answer is
-# "Invalid Command" or it is not. `get_diary` is the positive control.
-V2_NAMES = [
-    "get_diary",  # control — must NOT read "Invalid Command"
-    "delete_exercise",
-    "remove_exercise",
-    "delete_exercises",
-    "del_exercise",
-    "exercise_delete",
-    "delete_entry",
-    "delete_entries",
-    "remove_entry",
-    "remove_entries",
-    "delete_diary_entry",
-    "delete_diary_entries",
-    "remove_diary_entry",
-    "delete_serving",
-    "remove_serving",
-    "delete_servings",
-    "delete_item",
-    "remove_item",
-    "delete",
-    "remove",
-]
+# `JSONObject["exerciseId"] not found.` -- the server naming its own
+# requirement, which is the whole mechanism this script runs on.
+MISSING = re.compile(r'JSONObject\["([^"]+)"\] not found')
 
-INVALID = "Invalid Command"
+# Now that the naming style is known to be abbreviated, the same sweep is
+# worth re-running over `del_` forms: delete_entries currently goes through v3,
+# and a v2 sibling of del_exercise would be more consistent.
+MORE_NAMES = ["del_serving", "del_food", "del_entry", "del_biometric", "del_note"]
 
 
 def show(rows, indent="      "):
@@ -115,71 +83,55 @@ def probe_rows(client, day):
     return found
 
 
-def name_sweep(client, day, entry):
-    """Ask the v2 dispatcher which command names exist at all."""
-    live = []
-    for name in V2_NAMES:
-        body = (
-            {"day": client._format_day(day), "config": {"call_version": 1}}
-            if name == "get_diary"
-            else {
-                "exercise": entry,
-                "id": entry.get("exerciseId"),
-                "config": {"call_version": 2},
-            }
-        )
+def value_for(key, entry, client, day):
+    """What to put under a key the server has just asked for.
+
+    The entry itself first -- it came from Cronometer and so uses Cronometer's
+    own names and types. The rest are the handful of fields that live on the
+    request rather than on the row.
+    """
+    if key in entry:
+        return entry[key]
+    return {
+        "userId": client._user_id,
+        "day": client._format_day(day),
+        "id": entry.get("exerciseId"),
+        "exerciseId": entry.get("exerciseId"),
+    }.get(key)
+
+
+def discover_body(client, day, entry, endpoint="/api/v2/del_exercise"):
+    """Send, read which key it wanted, add it, send again.
+
+    Returns (body, response) on success, or (body, None) when it stops making
+    progress -- which is either an error that is not a missing field, or a key
+    nothing here knows how to fill.
+    """
+    body = {"config": {"call_version": 2}}
+    for step in range(10):
         try:
-            data = client._request(f"/api/v2/{name}", body)
-            text = json.dumps(data)
+            data = client._request(endpoint, dict(body))
         except Exception as exc:  # noqa: BLE001 — that IS the result
-            text = f"raised: {exc}"
-        known = INVALID not in text
-        flag = "•" if known else " "
-        print(f"      {flag} {name:24} {text[:110]}")
-        if known:
-            live.append(name)
-    return live
+            print(f"      step {step}: raised {exc}")
+            return body, None
 
+        err = data.get("error") if isinstance(data, dict) else None
+        if not err:
+            print(f"      step {step}: ✓ {json.dumps(data)[:120]}")
+            return body, data
 
-def v3_variants(client, entry):
-    """Schema and path variants for the v3 DELETE, which takes servings fine."""
-    eid = entry.get("exerciseId")
-    out = []
-
-    def add(label, path, body):
-        out.append((label, path, body))
-
-    add(
-        "type='EXERCISE'",
-        "/diary-entries",
-        {"diaryEntries": [{**entry, "type": "EXERCISE"}]},
-    )
-    add(
-        "type='exercise'",
-        "/diary-entries",
-        {"diaryEntries": [{**entry, "type": "exercise"}]},
-    )
-    add(
-        "id alongside exerciseId",
-        "/diary-entries",
-        {"diaryEntries": [{**entry, "id": eid}]},
-    )
-    add("wrapper 'exercises'", "/diary-entries", {"exercises": [entry]})
-    add("collection /exercises", "/exercises", {"exercises": [entry]})
-    add("collection /exercise-entries", "/exercise-entries", {"diaryEntries": [entry]})
-    add("path /exercises/{id}", f"/exercises/{eid}", None)
-
-    results = []
-    for label, path, body in out:
-        try:
-            resp = client._request_v3("DELETE", path, json_body=body)
-            status, text = resp.status_code, resp.text[:110]
-        except Exception as exc:  # noqa: BLE001 — that IS the result
-            status, text = "raise", str(exc)[:110]
-        ok = status in (200, 201, 204)
-        print(f"      {'✓' if ok else '✗'} {label:30} HTTP {status}  {text}")
-        results.append((label, ok))
-    return [label for label, ok in results if ok]
+        print(f"      step {step}: {json.dumps(data)[:120]}")
+        match = MISSING.search(err)
+        if not match:
+            return body, None  # not a missing-field error
+        key = match.group(1)
+        value = value_for(key, entry, client, day)
+        if value is None and key not in entry:
+            print(f"      step {step}: asked for {key!r} and nothing here has it")
+            return body, None
+        print(f"                  -> adding {key}={value!r}")
+        body[key] = value
+    return body, None
 
 
 def main():
@@ -189,61 +141,66 @@ def main():
         print(f"  credentials from {_dotenv}")
     client = CronometerClient()
 
-    print(f"\n[1] probe rows already in the diary, back {SWEEP_DAYS} days")
+    print(f"\n[1] probe rows in the diary, back {SWEEP_DAYS} days")
     rows = probe_rows(client, day)
     show([r for _, r in rows])
-
-    if rows:
-        target_day, target = rows[0]
-        print(f"      targeting id={target.get('exerciseId')} on {target_day}")
-        print("      (no new row created — earlier runs left these)")
-    else:
-        print("\n[1b] nothing to target — creating one row to work on")
-        created = client.add_exercise(
-            name=PROBE_NAME, calories=123, minutes=45, day=day
-        )
-        target_day, target = day, created
+    if not rows:
+        print("\n      nothing to delete — creating one row to work on")
+        created = client.add_exercise(name=PROBE_NAME, calories=123, day=day)
+        rows = [(day, created)]
         print(f"      created id={created.get('exerciseId')}")
 
-    print("\n[2] which v2 command names exist? (• = real, blank = Invalid Command)")
-    live = name_sweep(client, target_day, target)
+    target_day, target = rows[0]
+    print("\n[2] del_exercise — asking it what body it wants")
+    print(f"      target id={target.get('exerciseId')} on {target_day}")
+    body, ok = discover_body(client, target_day, target)
 
-    print("\n[3] v3 DELETE schema and path variants")
-    v3_ok = v3_variants(client, target)
-
-    print("\n[4] did anything actually remove the row?")
-    left = [
+    print("\n[3] did the row actually go?")
+    still = [
         r
         for _, r in probe_rows(client, target_day)
         if str(r.get("exerciseId")) == str(target.get("exerciseId"))
     ]
-    gone = not left
+    gone = not still
     print(f"      target row {'GONE' if gone else 'still present'}")
 
-    print("\n[5] verdict")
-    unexpected = [n for n in live if n != "get_diary"]
-    if unexpected:
-        print(f"      v2 names that exist: {unexpected}")
-    else:
-        print("      no v2 delete command name exists (control get_diary did")
-        print("      answer, so the oracle is sound)")
-    if v3_ok:
-        print(f"      v3 variants accepted: {v3_ok}")
     if gone:
-        print("      and the row is gone — that is the delete path.")
+        shape = {k: v for k, v in body.items() if k != "config"}
+        print(f"\n[4] the body del_exercise needs: {json.dumps(shape)}")
+        remaining = probe_rows(client, day)
+        if remaining:
+            print(f"      clearing {len(remaining)} leftover row(s)")
+            for d, r in remaining:
+                out = {k: value_for(k, r, client, d) for k in shape}
+                out["config"] = {"call_version": 2}
+                try:
+                    client._request("/api/v2/del_exercise", out)
+                    print(f"      removed {r.get('exerciseId')}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"      ✗ {r.get('exerciseId')}: {exc}")
     else:
-        print("      nothing deletes an exercise entry through this API.")
-        print("      Ship without it: editing a row to 0 kcal has exactly the")
-        print("      same effect on the day's budget, and the ledger never")
-        print("      needs to retract a row it can instead zero.")
+        print(f"\n[4] no luck. Last body tried: {json.dumps(body)}")
+        if ok is None:
+            print("      The loop stopped because the error was not a missing")
+            print("      field. That error text is the thing to read.")
 
-    remaining = probe_rows(client, day)
-    if remaining:
-        print(f"\n[6] {len(remaining)} probe row(s) to delete BY HAND in the app:")
-        for d, r in remaining:
+    print("\n[5] other `del_` names, now that the naming style is known")
+    for name in MORE_NAMES:
+        try:
+            data = client._request(f"/api/v2/{name}", {"config": {"call_version": 2}})
+            text = json.dumps(data)
+        except Exception as exc:  # noqa: BLE001 — that IS the result
+            text = f"raised: {exc}"
+        known = "Invalid Command" not in text
+        print(f"      {'•' if known else ' '} {name:16} {text[:100]}")
+
+    left = probe_rows(client, day)
+    if left:
+        print(f"\n[6] {len(left)} probe row(s) still in the diary:")
+        for d, r in left:
             print(f"      {d}  id={r.get('exerciseId')}")
-    else:
-        print("\n[6] nothing left behind")
+        return 1
+    print("\n[6] nothing left behind")
     return 0
 
 

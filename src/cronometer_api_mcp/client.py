@@ -640,8 +640,27 @@ class CronometerClient:
     # So the v3 diary-entries collection handles servings and does not know
     # about exercise. Both verbs below answered 200 first time.
 
+    def _v2_checked(self, endpoint: str, payload: dict) -> dict:
+        """POST a v2 command and raise if the dispatcher reported a failure.
+
+        `_request` only treats `result == "FAILURE"` as an error, but this API
+        answers **"FAIL"** -- every rejection observed while probing came back
+        that way, which means a refused command returns looking like a
+        success. Anything that writes goes through here rather than trusting
+        that.
+
+        The dispatcher's two failure modes are both worth reading:
+        `"Invalid Command"` means the endpoint name does not exist, while
+        `JSONObject["x"] not found.` is a real endpoint naming the field it
+        wanted.
+        """
+        data = self._request(endpoint, payload)
+        if isinstance(data, dict) and data.get("result") in ("FAIL", "FAILURE"):
+            raise CronometerError(f"{endpoint}: {data.get('error') or data}")
+        return data
+
     def _exercise_request(self, endpoint: str, entry: dict) -> dict:
-        return self._request(
+        return self._v2_checked(
             endpoint, {"exercise": entry, "config": {"call_version": 2}}
         )
 
@@ -772,14 +791,21 @@ class CronometerClient:
             logger.warning("No matching exercise entries on %s", self._format_day(day))
             return {"removed": [], "count": 0}
 
-        resp = self._request_v3(
-            "DELETE", "/diary-entries", json_body={"diaryEntries": to_delete}
-        )
-        if resp.status_code != 204:
-            raise CronometerError(
-                f"Delete failed with status {resp.status_code}: {resp.text[:300]}"
+        # `del_exercise`, not `delete_exercise`. Found by asking the v2
+        # dispatcher which names it knows: delete_exercise, remove_exercise,
+        # delete_exercises and six other guesses all answered "Invalid
+        # Command", while this one answered
+        # `JSONObject["exerciseId"] not found.` -- a real endpoint naming what
+        # it wanted. Nothing in v3 deletes an exercise: DELETE /diary-entries
+        # 400s on one although it 204s on servings, and /exercises,
+        # /exercise-entries and /diary-entries/{id} are all 404.
+        removed = []
+        for entry in to_delete:
+            self._v2_checked(
+                "/api/v2/del_exercise",
+                {"exerciseId": entry["exerciseId"], "config": {"call_version": 2}},
             )
-        removed = [str(e["exerciseId"]) for e in to_delete]
+            removed.append(str(entry["exerciseId"]))
         logger.info(
             "Deleted %d exercise entries for %s: %s",
             len(removed),
