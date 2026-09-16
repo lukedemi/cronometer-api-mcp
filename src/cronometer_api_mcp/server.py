@@ -20,7 +20,10 @@ mcp = FastMCP(
         "macro targets, biometrics, and fasting history from Cronometer. "
         "Use search_foods to find foods, get_food_details for nutrition info "
         "and serving sizes, add_food_entry to log meals, and get_food_log to "
-        "review what was eaten."
+        "review what was eaten. Exercise entries are separate from food: "
+        "get_exercise_log, add_exercise_entry, update_exercise_entry and "
+        "remove_exercise_entry act on the burn side of the day, and adding "
+        "one RAISES the calorie target rather than spending it."
     ),
 )
 
@@ -238,6 +241,209 @@ def remove_food_entry(
         client = _get_client()
         day = _parse_date(date)
         result = client.delete_entries(entry_ids, day)
+        return _ok(
+            {
+                "removed": result.get("removed", []),
+                "count": result.get("count", 0),
+                "date": date or str(date_module_today()),
+            }
+        )
+    except Exception as e:
+        return _err(e)
+
+
+# ------------------------------------------------------------------
+# Diary: exercise
+# ------------------------------------------------------------------
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def get_exercise_log(date: str | None = None) -> str:
+    """List the exercise entries in the Cronometer diary for a day.
+
+    These are the rows that make up the burn side of the Energy Summary,
+    alongside BMR and Cronometer's own activity-level baseline. Rows synced
+    from a wearable are included and are marked with a `source` (e.g. "Oura").
+
+    Each row's `exercise_id` is what add/update/remove act on. Note it is the
+    ENTRY's id, not a catalogue id -- which exercise it is lives in
+    `activity_id`, where 0 means a free-form row.
+
+    `calories` is reported POSITIVE here (energy burned), though the diary
+    stores it negated.
+
+    Args:
+        date: Date as YYYY-MM-DD (defaults to today).
+    """
+    try:
+        client = _get_client()
+        rows = client.get_exercises(_parse_date(date))
+        return _ok(
+            {
+                "date": date or str(date_module_today()),
+                "count": len(rows),
+                "exercises": [
+                    {
+                        "exercise_id": r.get("exerciseId"),
+                        "name": r.get("name"),
+                        "calories": abs(r.get("calories") or 0),
+                        "minutes": r.get("minutes"),
+                        "activity_id": r.get("activityId"),
+                        "calorie_override": r.get("calorieOverride"),
+                        "source": r.get("source"),
+                    }
+                    for r in rows
+                ],
+            }
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+def add_exercise_entry(
+    name: str,
+    calories: float,
+    minutes: int = 0,
+    date: str | None = None,
+    activity_id: int = 0,
+) -> str:
+    """Log an exercise entry, with its energy pinned to the value given.
+
+    The entry is written with `calorieOverride` set, so Cronometer keeps the
+    number supplied rather than recomputing it from its own MET tables and
+    the duration. That is the point of this tool: it is for energy measured
+    somewhere else -- a power meter, a ring, a coach's model -- being recorded
+    where the day's calorie budget is kept.
+
+    Adding an entry RAISES the day's calorie target, because Cronometer
+    budgets against expenditure. Before adding, check get_food_log's burn
+    breakdown for what is already counted: a tracker that is still connected
+    reports into `tracker_activity_kcal` and an entry added on top of it
+    double-counts the same activity.
+
+    Args:
+        name: Row name as it appears in the diary.
+        calories: Energy burned in kcal, positive.
+        minutes: Duration. Recorded for legibility; it does not set the energy.
+        date: Date as YYYY-MM-DD (defaults to today).
+        activity_id: Catalogue exercise id, or 0 for a free-form row.
+    """
+    try:
+        client = _get_client()
+        entry = client.add_exercise(
+            name=name,
+            calories=calories,
+            minutes=minutes,
+            day=_parse_date(date),
+            activity_id=activity_id,
+        )
+        return _ok(
+            {
+                "date": date or str(date_module_today()),
+                "exercise_id": entry.get("exerciseId"),
+                "name": entry.get("name", name),
+                "calories": abs(entry.get("calories") or calories),
+                "minutes": entry.get("minutes", minutes),
+            }
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def update_exercise_entry(
+    exercise_id: int,
+    calories: float | None = None,
+    minutes: int | None = None,
+    name: str | None = None,
+    date: str | None = None,
+) -> str:
+    """Change an existing exercise entry in place.
+
+    Use this rather than remove-then-add when a figure improves -- an estimate
+    replaced by a measurement is the same row learning a better value. Only
+    the fields given are changed; the rest of the entry is preserved.
+
+    Use get_exercise_log to find `exercise_id`.
+
+    Args:
+        exercise_id: The entry's id, from get_exercise_log.
+        calories: New energy in kcal, positive. Also re-pins calorieOverride.
+        minutes: New duration.
+        name: New row name.
+        date: Date the entry belongs to as YYYY-MM-DD (defaults to today).
+    """
+    try:
+        client = _get_client()
+        entry = client.update_exercise(
+            exercise_id=exercise_id,
+            calories=calories,
+            minutes=minutes,
+            name=name,
+            day=_parse_date(date),
+        )
+        return _ok(
+            {
+                "date": date or str(date_module_today()),
+                "exercise_id": entry.get("exerciseId", exercise_id),
+                "name": entry.get("name"),
+                "calories": abs(entry.get("calories") or 0),
+                "minutes": entry.get("minutes"),
+            }
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def remove_exercise_entry(
+    exercise_ids: list[str],
+    date: str | None = None,
+) -> str:
+    """Remove one or more exercise entries from the Cronometer diary.
+
+    Note this is a different tool from remove_food_entry, and not
+    interchangeable with it: that one matches on serving ids, which exercise
+    rows do not have, so it would quietly match nothing and report success.
+
+    Use get_exercise_log to find the ids.
+
+    Args:
+        exercise_ids: List of exercise entry IDs to remove.
+        date: Date the entries belong to as YYYY-MM-DD (defaults to today).
+    """
+    try:
+        client = _get_client()
+        result = client.delete_exercises(exercise_ids, _parse_date(date))
         return _ok(
             {
                 "removed": result.get("removed", []),

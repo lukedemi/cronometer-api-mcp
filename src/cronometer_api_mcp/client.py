@@ -605,6 +605,208 @@ class CronometerClient:
             )
 
     # ------------------------------------------------------------------
+    # Diary: exercise entries
+    # ------------------------------------------------------------------
+
+    # An exercise row is an ordinary diary entry with type "Exercise". A row
+    # synced from a wearable looks like this, and it is the shape everything
+    # below is modelled on:
+    #
+    #     {"type": "Exercise", "name": "Daily Activity (Oura)",
+    #      "exerciseId": 856117395, "minutes": 563, "calories": -2943.6,
+    #      "activityId": 0, "activitySpecId": 0, "calorieOverride": false,
+    #      "weight": 0, "source": "Oura", "day": "2026-09-14", "order": 0}
+    #
+    # Three things to know before changing any of it:
+    #
+    #   * calories are NEGATIVE -- the diary stores burned energy as a debit.
+    #   * exerciseId is the ENTRY's own id, not a catalogue id. Which exercise
+    #     it is lives in activityId; 0 means "none", which is what an
+    #     externally-sourced row carries and what a free-form row wants.
+    #   * calorieOverride pins the number. Left false, Cronometer is free to
+    #     recompute the row from its own MET tables and the entry's minutes,
+    #     which would silently discard a figure measured elsewhere.
+
+    def _write_diary_entries(self, method: str, entries: list[dict]) -> list[dict]:
+        """Create or replace diary entries through the v3 collection.
+
+        DELETE /api/v3/user/{id}/diary-entries is proven (delete_entries uses
+        it and Cronometer answers 204). POST and PUT on the same collection
+        are inferred from it rather than observed, so a 404 or 405 -- and only
+        those two, which are the codes that mean "no such endpoint" -- falls
+        back to the older v2 verb-per-action style. Whichever path answers is
+        logged, because the next person to read this should not have to guess
+        again.
+        """
+        resp = self._request_v3(
+            method, "/diary-entries", json_body={"diaryEntries": entries}
+        )
+        if resp.status_code in (404, 405):
+            v2 = "/api/v2/add_exercise" if method == "POST" else "/api/v2/edit_exercise"
+            logger.warning(
+                "v3 %s /diary-entries not available (%d); falling back to %s",
+                method,
+                resp.status_code,
+                v2,
+            )
+            out = []
+            for entry in entries:
+                data = self._request(
+                    v2, {"exercise": entry, "config": {"call_version": 2}}
+                )
+                out.append(data)
+            return out
+
+        if resp.status_code not in (200, 201, 204):
+            raise CronometerError(
+                f"{method} /diary-entries failed with status "
+                f"{resp.status_code}: {resp.text[:300]}"
+            )
+        logger.info(
+            "v3 %s /diary-entries: %d entry/entries, HTTP %d",
+            method,
+            len(entries),
+            resp.status_code,
+        )
+        if resp.status_code == 204 or not resp.text.strip():
+            return entries
+        body = resp.json()
+        return body if isinstance(body, list) else [body]
+
+    def get_exercises(self, day: date | None = None) -> list[dict]:
+        """Every exercise row in the diary for a day, wearable rows included.
+
+        These are what the burn side of the Energy Summary is made of, and
+        they are the only entries `delete_exercises` and `update_exercise`
+        can act on -- both match on `exerciseId`, which food entries lack.
+        """
+        diary = self.get_diary(day)
+        return [e for e in diary.get("diary", []) if e.get("type") == "Exercise"]
+
+    def add_exercise(
+        self,
+        name: str,
+        calories: float,
+        minutes: int = 0,
+        day: date | None = None,
+        activity_id: int = 0,
+    ) -> dict:
+        """Log an exercise entry with its energy pinned to `calories`.
+
+        Args:
+            name: Row name as it appears in the diary.
+            calories: Energy burned, in kcal, POSITIVE. Stored negated,
+                      because that is how the diary represents a debit.
+            minutes: Duration. Recorded for legibility; it does not set the
+                     energy, because calorieOverride does.
+            day: Date to log to. Defaults to today.
+            activity_id: Catalogue exercise id, or 0 for a free-form row.
+
+        Returns the created entry.
+        """
+        entry = {
+            "type": "Exercise",
+            "userId": self._user_id,
+            "day": self._format_day(day),
+            "name": name,
+            "activityId": activity_id,
+            "activitySpecId": 0,
+            "minutes": int(minutes),
+            "calories": -abs(float(calories)),
+            "calorieOverride": True,
+            "weight": 0,
+            "order": 0,
+            "meta": {},
+        }
+        created = self._write_diary_entries("POST", [entry])
+        logger.info(
+            "Logged exercise: %s, %.0f kcal, %d min, day=%s",
+            name,
+            abs(calories),
+            minutes,
+            self._format_day(day),
+        )
+        return created[0] if created else entry
+
+    def update_exercise(
+        self,
+        exercise_id: int | str,
+        calories: float | None = None,
+        minutes: int | None = None,
+        name: str | None = None,
+        day: date | None = None,
+    ) -> dict:
+        """Change an existing exercise row in place.
+
+        The whole entry is read back and sent again with the named fields
+        replaced -- the v3 collection takes full objects, the way
+        `delete_entries` already has to.
+
+        Updating rather than deleting-and-recreating is deliberate: a row that
+        is removed and re-added every time a number moves loses its place in
+        the diary and its own history, and an estimate that becomes a
+        measurement is the same row learning a better value, not a new one.
+        """
+        current = next(
+            (
+                e
+                for e in self.get_exercises(day)
+                if str(e.get("exerciseId")) == str(exercise_id)
+            ),
+            None,
+        )
+        if current is None:
+            raise CronometerError(
+                f"No exercise entry {exercise_id} on {self._format_day(day)}"
+            )
+
+        entry = dict(current)
+        if calories is not None:
+            entry["calories"] = -abs(float(calories))
+            entry["calorieOverride"] = True
+        if minutes is not None:
+            entry["minutes"] = int(minutes)
+        if name is not None:
+            entry["name"] = name
+
+        updated = self._write_diary_entries("PUT", [entry])
+        logger.info("Updated exercise %s on %s", exercise_id, self._format_day(day))
+        return updated[0] if updated else entry
+
+    def delete_exercises(
+        self, exercise_ids: list[str], day: date | None = None
+    ) -> dict:
+        """Remove exercise rows by their `exerciseId`.
+
+        Separate from `delete_entries` because that one matches on
+        `servingId`, which an exercise row does not have -- passing an
+        exercise id to it silently matches nothing and reports success.
+        """
+        id_set = {str(i) for i in exercise_ids}
+        to_delete = [
+            e for e in self.get_exercises(day) if str(e.get("exerciseId")) in id_set
+        ]
+        if not to_delete:
+            logger.warning("No matching exercise entries on %s", self._format_day(day))
+            return {"removed": [], "count": 0}
+
+        resp = self._request_v3(
+            "DELETE", "/diary-entries", json_body={"diaryEntries": to_delete}
+        )
+        if resp.status_code != 204:
+            raise CronometerError(
+                f"Delete failed with status {resp.status_code}: {resp.text[:300]}"
+            )
+        removed = [str(e["exerciseId"]) for e in to_delete]
+        logger.info(
+            "Deleted %d exercise entries for %s: %s",
+            len(removed),
+            self._format_day(day),
+            removed,
+        )
+        return {"removed": removed, "count": len(removed)}
+
+    # ------------------------------------------------------------------
     # Diary: mark day complete
     # ------------------------------------------------------------------
 
