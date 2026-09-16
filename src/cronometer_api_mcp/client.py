@@ -116,7 +116,10 @@ class CronometerClient:
         """
         try:
             raw = self._session_path.read_text()
-        except FileNotFoundError, OSError:
+        except OSError:
+            # Was `except FileNotFoundError, OSError:` -- Python 2 syntax, so
+            # the module did not import at all. FileNotFoundError is an
+            # OSError subclass, so catching OSError alone covers both.
             return
         try:
             data = json.loads(raw)
