@@ -12,8 +12,16 @@ It creates one throwaway entry, reads it back, updates it, reads it again and
 deletes it, printing what Cronometer said at every step. **It always cleans up
 after itself**, including when a step fails.
 
-    CRONOMETER_USERNAME=... CRONOMETER_PASSWORD=... \\
-        python3 scripts/probe_exercise.py [YYYY-MM-DD]
+    uv run python scripts/probe_exercise.py [YYYY-MM-DD]
+
+Credentials come from `.env` in the repo root (gitignored), the same file
+`server.main()` reads, or from the environment if they are already set there.
+Prefer the file: a password with a `!`, a `$` or a space in it does not
+survive being typed on a shell command line, and Cronometer's answer to a
+mangled password is indistinguishable from its answer to a wrong one.
+
+    printf 'CRONOMETER_USERNAME=%s\\nCRONOMETER_PASSWORD=%s\\n' \\
+        'you@example.com' 'the password' > .env
 
 What to look for in the output:
 
@@ -35,7 +43,15 @@ from datetime import date
 
 sys.path.insert(0, "src")
 
+from dotenv import find_dotenv, load_dotenv  # noqa: E402
+
 from cronometer_api_mcp.client import CronometerClient  # noqa: E402
+
+# Same as server.main(): override=False keeps a real environment variable
+# authoritative over the file, so an explicit `FOO=bar uv run ...` still wins.
+_dotenv = find_dotenv(usecwd=True)
+if _dotenv:
+    load_dotenv(_dotenv, override=False)
 
 PROBE_NAME = "zz probe — delete me"
 PROBE_KCAL = 123
@@ -60,6 +76,8 @@ def show(rows):
 def main():
     logging.basicConfig(level=logging.INFO, format="  %(levelname)-7s %(message)s")
     day = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date.today()
+    if _dotenv:
+        print(f"  credentials from {_dotenv}")
     client = CronometerClient()
     created = None
 
