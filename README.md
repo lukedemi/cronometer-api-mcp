@@ -19,7 +19,7 @@ Unlike [cronometer-mcp](https://github.com/cphoskins/cronometer-mcp), which take
 - **Nutrition data** -- daily macro/micro totals and nutrition scores with per-nutrient confidence
 - **Food search** -- search the Cronometer food database, get detailed nutrition info
 - **Diary management** -- add/remove entries, copy days, mark days complete
-- **Exercise** -- read, add, update and remove exercise entries, with calories pinned rather than recomputed from Cronometer's MET tables, so energy measured elsewhere (a power meter, a ring) can be recorded where the calorie budget is kept
+- **Exercise** -- read, add, update and remove exercise entries, with calories pinned rather than recomputed from Cronometer's MET tables, so energy measured elsewhere (a power meter, a ring) can be recorded where the calorie budget is kept. Adding one *raises* the day's calorie target, since Cronometer budgets against expenditure
 - **Custom foods** -- create foods with custom nutrition data
 - **Macro targets** -- read weekly schedule and saved templates
 - **Fasting** -- view history and aggregate statistics

@@ -561,6 +561,15 @@ class CronometerClient:
 
         Uses: DELETE /api/v3/user/{userId}/diary-entries
 
+        NOTE (probed 2026-09-16): a v2 `del_serving` exists and wants only
+        `{"servingId": id}` -- it answers "Missing servingId" when sent an
+        empty body, so it is real. That would drop the get_diary round trip
+        and the full-object payload this method needs. Left alone because the
+        v3 path works and is proven; recorded so the next person does not have
+        to find it again. Siblings from the same sweep, all real: `del_food`
+        (wants `id`), `del_biometric` (`biometricId`), `del_note` (`noteId`).
+        `del_entry` does not exist.
+
         Args:
             entry_ids: List of serving IDs to delete (as strings).
             day: The day the entries belong to. Defaults to today.
