@@ -761,16 +761,19 @@ def add_custom_food(
             serving_grams=serving_grams,
         )
 
-        # Fetch back to get the server-assigned measure_id
-        food_data = client.get_food(result["food_id"])
-        result["measure_id"] = food_data.get("defaultMeasureId")
-
+        # create_custom_food resolves the gram ("g") measure by name server-side,
+        # so measure_id here logs by weight -- do NOT override with
+        # defaultMeasureId, which may point at the named serving (e.g. "full
+        # batch") and would silently log whole servings instead of grams.
         return _ok(
             {
                 "food_id": result["food_id"],
                 "measure_id": result["measure_id"],
                 "name": name,
-                "note": "Use food_id and measure_id with add_food_entry to log this food.",
+                "note": (
+                    "Use food_id and measure_id (grams) with add_food_entry to log "
+                    "this food by weight."
+                ),
             }
         )
     except Exception as e:

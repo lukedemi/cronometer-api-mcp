@@ -400,12 +400,35 @@ class CronometerClient:
         They are normalized to per-100g internally, since Cronometer stores
         all nutrient data on a per-100g basis.
 
-        Returns {"food_id": int, "measure_id": int | None}.
+        Returns {"food_id": int, "measure_id": int | None}, where measure_id
+        is the GRAM measure -- so the caller can log any weight of the food
+        rather than whole servings of it.
         """
         # Cronometer stores nutrients per 100g -- normalize from per-serving.
         scale = 100.0 / serving_grams if serving_grams > 0 else 1.0
 
         net_carbs = max(0, carbs_g - fiber_g)
+
+        # Always expose a gram measure so the food can be portioned by weight.
+        # These ids are placeholders; Cronometer reassigns real ids server-side.
+        measures = [
+            {"id": 0, "name": "g", "value": 1.0, "amount": 1.0, "type": "Atomic"}
+        ]
+        # Add the named serving only when it isn't itself grams (avoid a duplicate
+        # gram measure that would collide with the one above).
+        named_is_grams = (
+            serving_name.strip().lower() in {"g", "gram", "grams"} or serving_grams == 1
+        )
+        if serving_name and not named_is_grams:
+            measures.append(
+                {
+                    "id": 1,
+                    "name": serving_name,
+                    "value": float(serving_grams),
+                    "amount": 1.0,
+                    "type": "Atomic",
+                }
+            )
 
         nutrients = [
             {"id": NUTRIENT_IDS["energy"], "amount": round(calories * scale, 2)},
@@ -438,15 +461,7 @@ class CronometerClient:
                 "defaultMeasureId": 0,
                 "comments": None,
                 "alternateId": None,
-                "measures": [
-                    {
-                        "id": 0,
-                        "name": serving_name,
-                        "value": serving_grams,
-                        "amount": 1.0,
-                        "type": "Atomic",
-                    }
-                ],
+                "measures": measures,
                 "labelType": "AMERICAN_2016",
                 "nutrients": nutrients,
                 "properties": {},
@@ -461,7 +476,27 @@ class CronometerClient:
             raise CronometerError(f"Failed to create custom food: {data}")
 
         logger.info("Created custom food %r (id=%d)", name, food_id)
-        return {"food_id": food_id, "measure_id": None}
+
+        # Cronometer reassigns real measure ids server-side, so fetch the created
+        # food and resolve the gram measure by NAME ("g") -- never by index/first
+        # entry, or add_food_entry could log whole servings while the UI shows grams.
+        measure_id = None
+        try:
+            created = self.get_food(food_id)
+            for m in created.get("measures", []):
+                if m.get("name", "").strip().lower() == "g":
+                    measure_id = m.get("id")
+                    break
+            if measure_id is None:
+                logger.warning(
+                    "Created food %d has no gram measure; measures=%r",
+                    food_id,
+                    created.get("measures"),
+                )
+        except CronometerError:
+            logger.warning("Could not resolve gram measure id for food %d", food_id)
+
+        return {"food_id": food_id, "measure_id": measure_id}
 
     # ------------------------------------------------------------------
     # Diary: add serving
