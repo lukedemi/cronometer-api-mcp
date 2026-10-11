@@ -101,7 +101,7 @@ export CRONOMETER_PASSWORD="your-password"
 
 | Tool | Description |
 |------|-------------|
-| `add_food_entry` | Log a food serving to the diary |
+| `add_food_entry` | Log a food serving to the diary, optionally at a given time of day (`time`, "HH:MM") |
 | `remove_food_entry` | Remove one or more diary entries |
 | `add_custom_food` | Create a custom food with specified nutrition |
 | `copy_day` | Copy all entries from the previous day |

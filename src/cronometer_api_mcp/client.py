@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from datetime import date, datetime
+from datetime import time as dtime
 from pathlib import Path
 
 import httpx
@@ -510,6 +511,7 @@ class CronometerClient:
         translation_id: int = 0,
         day: date | None = None,
         diary_group: int = 0,
+        at: dtime | None = None,
     ) -> dict:
         """Log a food serving to the diary.
 
@@ -524,15 +526,17 @@ class CronometerClient:
             day: Date to log to. Defaults to today.
             diary_group: Meal group. 0 = auto (based on time of day),
                          1 = Breakfast, 2 = Lunch, 3 = Dinner, 4 = Snacks.
+            at: The entry's time of day, e.g. when a meal was eaten. Defaults
+                to now. "auto" picks the meal group from this time too.
 
         Returns the serving confirmation dict from the API.
         """
-        now = datetime.now()
+        when = at or datetime.now().time()
         day_str = self._format_day(day)
-        time_str = f"{now.hour}:{now.minute}:{now.second}"
+        time_str = f"{when.hour}:{when.minute}:{when.second}"
 
         if diary_group == 0:
-            diary_group = _meal_group_for_hour(now.hour)
+            diary_group = _meal_group_for_hour(when.hour)
 
         serving = {
             "order": (diary_group << 16) | 1,

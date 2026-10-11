@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from datetime import date, timedelta
+from datetime import time as dtime
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -52,6 +53,18 @@ def _parse_date(d: str | None) -> date | None:
     if d is None:
         return None
     return date.fromisoformat(d)
+
+
+def _parse_time(t: str | None) -> dtime | None:
+    """'HH:MM' or 'HH:MM:SS' (24-hour) to a time of day; None stays None."""
+    if t is None or not str(t).strip():
+        return None
+    parts = str(t).strip().split(":")
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+        raise ValueError(f"Invalid time '{t}'. Use 24-hour HH:MM or HH:MM:SS.")
+    hour, minute = int(parts[0]), int(parts[1])
+    second = int(parts[2]) if len(parts) == 3 else 0
+    return dtime(hour, minute, second)
 
 
 def _ok(data: dict) -> str:
@@ -175,6 +188,7 @@ def add_food_entry(
     date: str | None = None,
     translation_id: int = 0,
     diary_group: str = "auto",
+    time: str | None = None,
 ) -> str:
     """Add a food entry to the Cronometer diary.
 
@@ -189,6 +203,9 @@ def add_food_entry(
         translation_id: Translation ID from search results (usually 0).
         diary_group: Meal slot -- one of "auto", "breakfast", "lunch",
                      "dinner", "snacks" (case-insensitive, default "auto").
+                     "auto" picks the slot from the entry's time.
+        time: Time of day the food was eaten, 24-hour "HH:MM" or "HH:MM:SS"
+              (defaults to now) -- e.g. when a photo of the meal was taken.
     """
     try:
         group_map = {
@@ -210,6 +227,7 @@ def add_food_entry(
 
         client = _get_client()
         day = _parse_date(date)
+        at = _parse_time(time)
         result = client.add_serving(
             food_id=food_id,
             measure_id=measure_id,
@@ -217,6 +235,7 @@ def add_food_entry(
             translation_id=translation_id,
             day=day,
             diary_group=group_int,
+            at=at,
         )
         return _ok(
             {
